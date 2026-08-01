@@ -6,7 +6,7 @@ services:
     container_name: cline-proxy
     restart: unless-stopped
     ports:
-      - "53457:3457"
+      - "3457:3457"
     volumes:
       - ./.cline-accounts.json:/app/.cline-accounts.json
       - ./override.md:/app/override.md:ro
