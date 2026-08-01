@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -37,11 +38,99 @@ func envOr(key, def string) string {
 // ==== Cookie session auth (login page instead of Basic Auth popup) ====
 const sessionCookieName = "cp_session"
 const sessionTTL = 7 * 24 * time.Hour
+const sessionsFile = ".admin-sessions.json"
 
 var (
-	adminSessions   = make(map[string]time.Time) // token -> expiry
-	adminSessionsMu sync.Mutex
+	adminSessions    = make(map[string]time.Time) // token -> expiry
+	adminSessionsMu  sync.Mutex
+	loadSessionsOnce sync.Once
 )
+
+// Sessions persist to a small JSON file so container rebuilds don't log
+// everyone out. Best-effort: failures only mean re-login after restart.
+func loadSessions() {
+	data, err := os.ReadFile(sessionsFile)
+	if err != nil {
+		return
+	}
+	m := map[string]time.Time{}
+	if json.Unmarshal(data, &m) != nil {
+		return
+	}
+	now := time.Now()
+	for t, exp := range m {
+		if now.Before(exp) {
+			adminSessions[t] = exp
+		}
+	}
+}
+
+// saveSessionsLocked writes the session map; callers must hold adminSessionsMu.
+func saveSessionsLocked() {
+	data, err := json.Marshal(adminSessions)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(sessionsFile, data, 0600)
+}
+
+// ==== Login brute-force lockout (per client IP) ====
+const loginMaxFails = 5
+const loginLockTime = 15 * time.Minute
+
+type loginFailState struct {
+	Count int
+	Until time.Time
+}
+
+var (
+	loginFails   = make(map[string]*loginFailState)
+	loginFailsMu sync.Mutex
+)
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// loginLocked reports whether ip is currently locked out.
+func loginLocked(ip string) (bool, time.Duration) {
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	st, ok := loginFails[ip]
+	if !ok {
+		return false, 0
+	}
+	if time.Now().Before(st.Until) {
+		return true, time.Until(st.Until)
+	}
+	return false, 0
+}
+
+func recordLoginFail(ip string) {
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	st := loginFails[ip]
+	if st == nil {
+		st = &loginFailState{}
+		loginFails[ip] = st
+	}
+	st.Count++
+	if st.Count >= loginMaxFails {
+		st.Until = time.Now().Add(loginLockTime)
+		st.Count = 0
+		log.Printf("admin login: IP %s locked for %v after repeated failures", ip, loginLockTime)
+	}
+}
+
+func clearLoginFails(ip string) {
+	loginFailsMu.Lock()
+	defer loginFailsMu.Unlock()
+	delete(loginFails, ip)
+}
 
 func newSessionToken() (string, error) {
 	b := make([]byte, 32)
@@ -58,12 +147,14 @@ func sessionValid(r *http.Request) bool {
 	}
 	adminSessionsMu.Lock()
 	defer adminSessionsMu.Unlock()
+	loadSessionsOnce.Do(loadSessions)
 	exp, ok := adminSessions[c.Value]
 	if !ok {
 		return false
 	}
 	if time.Now().After(exp) {
 		delete(adminSessions, c.Value)
+		saveSessionsLocked()
 		return false
 	}
 	return true
@@ -108,6 +199,13 @@ func handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(strings.ReplaceAll(loginHTML, "{{BASE}}", base)))
 	case "POST":
+		ip := clientIP(r)
+		if locked, left := loginLocked(ip); locked {
+			writeAPI(w, http.StatusTooManyRequests, apiResponse{
+				Error: fmt.Sprintf("失败次数过多，请 %d 分钟后再试", int(left.Minutes())+1),
+			})
+			return
+		}
 		var body struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
@@ -117,16 +215,19 @@ func handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !credentialsValid(body.Username, body.Password) {
+			recordLoginFail(ip)
 			time.Sleep(500 * time.Millisecond) // slow brute force a bit
 			writeAPI(w, http.StatusUnauthorized, apiResponse{Error: "用户名或密码错误"})
 			return
 		}
+		clearLoginFails(ip)
 		token, err := newSessionToken()
 		if err != nil {
 			writeAPI(w, http.StatusInternalServerError, apiResponse{Error: "internal error"})
 			return
 		}
 		adminSessionsMu.Lock()
+		loadSessionsOnce.Do(loadSessions)
 		adminSessions[token] = time.Now().Add(sessionTTL)
 		// opportunistic cleanup of expired sessions
 		for t, exp := range adminSessions {
@@ -134,6 +235,7 @@ func handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 				delete(adminSessions, t)
 			}
 		}
+		saveSessionsLocked()
 		adminSessionsMu.Unlock()
 		http.SetCookie(w, &http.Cookie{
 			Name:     sessionCookieName,
@@ -155,6 +257,7 @@ func handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookieName); err == nil {
 		adminSessionsMu.Lock()
 		delete(adminSessions, c.Value)
+		saveSessionsLocked()
 		adminSessionsMu.Unlock()
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -198,23 +301,25 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(base+"/login", handleAdminLogin)
 	mux.HandleFunc(base+"/logout", handleAdminLogout)
 	mux.HandleFunc(base+"/", adminAuth(adminStaticHandler))
-	mux.HandleFunc(base+"/api/accounts", corsHandler(adminAuth(handleAdminAccounts)))
-	mux.HandleFunc(base+"/api/accounts/add", corsHandler(adminAuth(handleAdminAccountAdd)))
-	mux.HandleFunc(base+"/api/accounts/delete", corsHandler(adminAuth(handleAdminAccountDelete)))
-	mux.HandleFunc(base+"/api/oauth/start", corsHandler(adminAuth(handleOAuthStart)))
-	mux.HandleFunc(base+"/api/oauth/status", corsHandler(adminAuth(handleOAuthStatus)))
-	mux.HandleFunc(base+"/api/sso/import", corsHandler(adminAuth(handleSSOImport)))
-	mux.HandleFunc(base+"/api/stats", corsHandler(adminAuth(handleAdminStats)))
-	mux.HandleFunc(base+"/api/batch-import", corsHandler(adminAuth(handleBatchImport)))
-	mux.HandleFunc(base+"/api/accounts/refresh-all", corsHandler(adminAuth(handleAdminRefreshAll)))
-	mux.HandleFunc(base+"/api/accounts/delete-all", corsHandler(adminAuth(handleAdminDeleteAll)))
-	mux.HandleFunc(base+"/api/accounts/reset", corsHandler(adminAuth(handleAdminAccountReset)))
-	mux.HandleFunc(base+"/api/keys", corsHandler(adminAuth(handleAdminGetKeys)))
-	mux.HandleFunc(base+"/api/keys/generate", corsHandler(adminAuth(handleAdminGenerateKey)))
-	mux.HandleFunc(base+"/api/keys/delete", corsHandler(adminAuth(handleAdminDeleteKey)))
-	mux.HandleFunc(base+"/api/models", corsHandler(adminAuth(handleAdminModels)))
-	mux.HandleFunc(base+"/api/config", corsHandler(adminAuth(handleAdminConfig)))
-	mux.HandleFunc(base+"/api/config/update", corsHandler(adminAuth(handleAdminUpdateConfig)))
+	// Admin APIs are same-origin only (served from the same panel page),
+	// so no CORS headers here — keeps them from being callable cross-origin.
+	mux.HandleFunc(base+"/api/accounts", adminAuth(handleAdminAccounts))
+	mux.HandleFunc(base+"/api/accounts/add", adminAuth(handleAdminAccountAdd))
+	mux.HandleFunc(base+"/api/accounts/delete", adminAuth(handleAdminAccountDelete))
+	mux.HandleFunc(base+"/api/oauth/start", adminAuth(handleOAuthStart))
+	mux.HandleFunc(base+"/api/oauth/status", adminAuth(handleOAuthStatus))
+	mux.HandleFunc(base+"/api/sso/import", adminAuth(handleSSOImport))
+	mux.HandleFunc(base+"/api/stats", adminAuth(handleAdminStats))
+	mux.HandleFunc(base+"/api/batch-import", adminAuth(handleBatchImport))
+	mux.HandleFunc(base+"/api/accounts/refresh-all", adminAuth(handleAdminRefreshAll))
+	mux.HandleFunc(base+"/api/accounts/delete-all", adminAuth(handleAdminDeleteAll))
+	mux.HandleFunc(base+"/api/accounts/reset", adminAuth(handleAdminAccountReset))
+	mux.HandleFunc(base+"/api/keys", adminAuth(handleAdminGetKeys))
+	mux.HandleFunc(base+"/api/keys/generate", adminAuth(handleAdminGenerateKey))
+	mux.HandleFunc(base+"/api/keys/delete", adminAuth(handleAdminDeleteKey))
+	mux.HandleFunc(base+"/api/models", adminAuth(handleAdminModels))
+	mux.HandleFunc(base+"/api/config", adminAuth(handleAdminConfig))
+	mux.HandleFunc(base+"/api/config/update", adminAuth(handleAdminUpdateConfig))
 }
 
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {

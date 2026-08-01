@@ -9,6 +9,7 @@ services:
       - "3457:3457"
     volumes:
       - ./.cline-accounts.json:/app/.cline-accounts.json
+      - ./.admin-sessions.json:/app/.admin-sessions.json
       - ./override.md:/app/override.md:ro
     environment:
       - PORT=3457
