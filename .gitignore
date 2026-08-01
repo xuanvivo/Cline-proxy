@@ -1,0 +1,10 @@
+# 账号与凭据，绝不提交
+.cline-accounts.json
+docker-compose.override.yml
+
+# 本地系统提示词覆盖
+override.md
+
+# 构建产物
+cline-proxy
+cline-proxy.exe

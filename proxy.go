@@ -220,7 +220,7 @@ func startProxy(port int) error {
 	mux.HandleFunc("/v1/messages", anthropicHandler)
 	mux.HandleFunc("/messages", anthropicHandler)
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	addr := fmt.Sprintf(":%d", port)
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -232,6 +232,7 @@ func startProxy(port int) error {
 	fmt.Println(strings.Repeat("=", 58))
 	fmt.Printf("  http://%s\n", addr)
 	fmt.Printf("  http://%s/v1\n", addr)
+	fmt.Printf("  Admin:   http://%s/%s/  (user: %s)\n", addr, adminBasePath, adminUser)
 	fmt.Println("  API Key: any value")
 	fmt.Printf("  Model:   %s\n", defaultModel)
 	fmt.Printf("  Accounts: %d total, %d active\n", len(loadPool().Accounts), activeCount)
@@ -338,15 +339,9 @@ func clineHeaders(token, sessionID string) http.Header {
 }
 
 func callClineAPI(params map[string]any, stream bool) (*http.Response, error) {
-	acc := pickAccount()
-	if acc == nil {
+	candidates := pickAccounts()
+	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no active accounts available. Use --login or admin API to add accounts")
-	}
-
-	token, err := ensureAccountToken(acc)
-	if err != nil {
-		// Try other accounts
-		return nil, fmt.Errorf("account %s token failed: %w", acc.Email, err)
 	}
 
 	body := buildUpstreamBody(params, stream)
@@ -357,66 +352,84 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, error) {
 		return nil, fmt.Errorf("marshal body: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", clineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header = clineHeaders(token, sessionID)
-
 	toolCount := 0
 	if tools, ok := params["tools"]; ok {
 		if t, ok := tools.([]any); ok {
 			toolCount = len(t)
 		}
 	}
-	log.Printf("  upstream: account=%s stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
-		truncateEmail(acc.Email), stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		acc.Status = "cooldown"
-		savePool()
-		return nil, fmt.Errorf("upstream request: %w", err)
+	doRequest := func(token string) (*http.Response, error) {
+		req, err := http.NewRequest("POST", clineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
+		if err != nil {
+			return nil, err
+		}
+		req.Header = clineHeaders(token, sessionID)
+		return httpClient.Do(req)
 	}
 
-	if resp.StatusCode == 401 {
-		resp.Body.Close()
-		// Refresh token and retry
-		if err := refreshAccountToken(acc); err == nil {
-			token = acc.AccessToken
-			req.Header = clineHeaders(token, sessionID)
-			resp, err = httpClient.Do(req)
+	var lastErr error
+	for i, acc := range candidates {
+		token, err := ensureAccountToken(acc)
+		if err != nil {
+			lastErr = fmt.Errorf("account %s token failed: %w", acc.Email, err)
+			log.Printf("  [%d/%d] account=%s token refresh failed, failover: %v", i+1, len(candidates), truncateEmail(acc.Email), err)
+			continue
+		}
+
+		log.Printf("  [%d/%d] upstream: account=%s stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
+			i+1, len(candidates), truncateEmail(acc.Email), stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
+
+		resp, err := doRequest(token)
+		if err != nil {
+			markCooldown(acc)
+			lastErr = fmt.Errorf("upstream request (account %s): %w", acc.Email, err)
+			log.Printf("  [%d/%d] account=%s network error, cooldown, failover: %v", i+1, len(candidates), truncateEmail(acc.Email), err)
+			continue
+		}
+
+		// Token expired mid-flight: refresh once and retry the SAME account.
+		if resp.StatusCode == 401 {
+			resp.Body.Close()
+			if err := refreshAccountToken(acc); err != nil {
+				markExpired(acc)
+				lastErr = fmt.Errorf("account %s refresh failed: %w", acc.Email, err)
+				log.Printf("  [%d/%d] account=%s refresh failed, expired, failover: %v", i+1, len(candidates), truncateEmail(acc.Email), err)
+				continue
+			}
+			resp, err = doRequest(acc.AccessToken)
 			if err != nil {
-				return nil, fmt.Errorf("upstream retry: %w", err)
+				markCooldown(acc)
+				lastErr = fmt.Errorf("upstream retry (account %s): %w", acc.Email, err)
+				log.Printf("  [%d/%d] account=%s retry error, failover: %v", i+1, len(candidates), truncateEmail(acc.Email), err)
+				continue
 			}
 			if resp.StatusCode == 401 {
 				resp.Body.Close()
-				acc.Status = "expired"
-				savePool()
-				return nil, fmt.Errorf("account %s token expired permanently", acc.Email)
+				markExpired(acc)
+				lastErr = fmt.Errorf("account %s token expired permanently", acc.Email)
+				log.Printf("  [%d/%d] account=%s expired, failover", i+1, len(candidates), truncateEmail(acc.Email))
+				continue
 			}
-		} else {
-			acc.Status = "expired"
-			savePool()
-			return nil, fmt.Errorf("account %s refresh failed: %w", acc.Email, err)
 		}
+
+		if resp.StatusCode != 200 {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == 429 {
+				markCooldown(acc)
+			}
+			lastErr = fmt.Errorf("API %d (account %s): %s", resp.StatusCode, acc.Email, truncate(string(bodyBytes), 500))
+			log.Printf("  [%d/%d] account=%s HTTP %d, failover", i+1, len(candidates), truncateEmail(acc.Email), resp.StatusCode)
+			continue
+		}
+
+		// Success.
+		markUsed(acc)
+		return resp, nil
 	}
 
-	if resp.StatusCode != 200 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		// Mark account on cooldown on rate limits
-		if resp.StatusCode == 429 {
-			acc.Status = "cooldown"
-			savePool()
-		}
-		return nil, fmt.Errorf("API %d: %s", resp.StatusCode, truncate(string(bodyBytes), 500))
-	}
-
-	acc.LastUsed = time.Now()
-	acc.UsageCount++
-	savePool()
-	return resp, nil
+	return nil, fmt.Errorf("all %d account(s) failed, last error: %w", len(candidates), lastErr)
 }
 
 func truncateEmail(email string) string {
@@ -1216,7 +1229,7 @@ func getNested(obj map[string]any, keys ...any) any {
 }
 
 func freePort(port int) {
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	addr := fmt.Sprintf(":%d", port)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return // port is free

@@ -6,9 +6,13 @@ services:
     container_name: cline-proxy
     restart: unless-stopped
     ports:
-      - "3457:3457"
+      - "53457:3457"
     volumes:
       - ./.cline-accounts.json:/app/.cline-accounts.json
       - ./override.md:/app/override.md:ro
     environment:
       - PORT=3457
+      # 实际部署凭据放在 docker-compose.override.yml（已 gitignore），不要提交到仓库
+      - ADMIN_PATH=admin
+      - ADMIN_USER=admin
+      - ADMIN_PASS=changeme

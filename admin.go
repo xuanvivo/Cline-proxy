@@ -1,15 +1,167 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 )
+
+// ==== Admin panel path + HTTP Basic Auth (public-exposure hardening) ====
+// All configurable via env; defaults are baked in for the current deployment.
+var (
+	adminBasePath = envOr("ADMIN_PATH", "admin")
+	adminUser     = envOr("ADMIN_USER", "admin")
+	adminPass     = envOr("ADMIN_PASS", "changeme")
+)
+
+func envOr(key, def string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if key == "ADMIN_PATH" {
+		return strings.Trim(v, "/")
+	}
+	return v
+}
+
+// ==== Cookie session auth (login page instead of Basic Auth popup) ====
+const sessionCookieName = "cp_session"
+const sessionTTL = 7 * 24 * time.Hour
+
+var (
+	adminSessions   = make(map[string]time.Time) // token -> expiry
+	adminSessionsMu sync.Mutex
+)
+
+func newSessionToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func sessionValid(r *http.Request) bool {
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil || c.Value == "" {
+		return false
+	}
+	adminSessionsMu.Lock()
+	defer adminSessionsMu.Unlock()
+	exp, ok := adminSessions[c.Value]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(adminSessions, c.Value)
+		return false
+	}
+	return true
+}
+
+func credentialsValid(u, p string) bool {
+	return subtle.ConstantTimeCompare([]byte(u), []byte(adminUser)) == 1 &&
+		subtle.ConstantTimeCompare([]byte(p), []byte(adminPass)) == 1
+}
+
+// adminAuth guards admin routes. Accepts a valid session cookie, or HTTP
+// Basic Auth (kept for scripts/curl). Browsers hitting a page without auth
+// are redirected to the styled login page instead of getting a popup.
+func adminAuth(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if sessionValid(r) {
+			h(w, r)
+			return
+		}
+		if u, p, ok := r.BasicAuth(); ok && credentialsValid(u, p) {
+			h(w, r)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/api/") {
+			writeAPI(w, http.StatusUnauthorized, apiResponse{Error: "unauthorized"})
+			return
+		}
+		http.Redirect(w, r, "/"+adminBasePath+"/login", http.StatusFound)
+	}
+}
+
+// GET  /<base>/login  -> styled login page
+// POST /<base>/login  -> validate credentials, set session cookie
+func handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	base := "/" + adminBasePath
+	switch r.Method {
+	case "GET":
+		if sessionValid(r) {
+			http.Redirect(w, r, base+"/", http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(strings.ReplaceAll(loginHTML, "{{BASE}}", base)))
+	case "POST":
+		var body struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid request"})
+			return
+		}
+		if !credentialsValid(body.Username, body.Password) {
+			time.Sleep(500 * time.Millisecond) // slow brute force a bit
+			writeAPI(w, http.StatusUnauthorized, apiResponse{Error: "用户名或密码错误"})
+			return
+		}
+		token, err := newSessionToken()
+		if err != nil {
+			writeAPI(w, http.StatusInternalServerError, apiResponse{Error: "internal error"})
+			return
+		}
+		adminSessionsMu.Lock()
+		adminSessions[token] = time.Now().Add(sessionTTL)
+		// opportunistic cleanup of expired sessions
+		for t, exp := range adminSessions {
+			if time.Now().After(exp) {
+				delete(adminSessions, t)
+			}
+		}
+		adminSessionsMu.Unlock()
+		http.SetCookie(w, &http.Cookie{
+			Name:     sessionCookieName,
+			Value:    token,
+			Path:     base,
+			MaxAge:   int(sessionTTL / time.Second),
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		})
+		writeAPI(w, http.StatusOK, apiResponse{Success: true})
+	default:
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+	}
+}
+
+// GET/POST /<base>/logout -> clear session, back to login page
+func handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	base := "/" + adminBasePath
+	if c, err := r.Cookie(sessionCookieName); err == nil {
+		adminSessionsMu.Lock()
+		delete(adminSessions, c.Value)
+		adminSessionsMu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookieName, Value: "", Path: base, MaxAge: -1, HttpOnly: true,
+	})
+	http.Redirect(w, r, base+"/login", http.StatusFound)
+}
 
 // In-memory OAuth login state for async browser login
 var (
@@ -42,31 +194,38 @@ func writeAPI(w http.ResponseWriter, status int, resp apiResponse) {
 }
 
 func registerAdminRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/admin/", adminStaticHandler)
-	mux.HandleFunc("/admin/api/accounts", corsHandler(handleAdminAccounts))
-	mux.HandleFunc("/admin/api/accounts/add", corsHandler(handleAdminAccountAdd))
-	mux.HandleFunc("/admin/api/accounts/delete", corsHandler(handleAdminAccountDelete))
-	mux.HandleFunc("/admin/api/oauth/start", corsHandler(handleOAuthStart))
-	mux.HandleFunc("/admin/api/oauth/status", corsHandler(handleOAuthStatus))
-	mux.HandleFunc("/admin/api/sso/import", corsHandler(handleSSOImport))
-	mux.HandleFunc("/admin/api/stats", corsHandler(handleAdminStats))
-	mux.HandleFunc("/admin/api/batch-import", corsHandler(handleBatchImport))
-	mux.HandleFunc("/admin/api/accounts/refresh-all", corsHandler(handleAdminRefreshAll))
-	mux.HandleFunc("/admin/api/accounts/delete-all", corsHandler(handleAdminDeleteAll))
-	mux.HandleFunc("/admin/api/accounts/reset", corsHandler(handleAdminAccountReset))
-	mux.HandleFunc("/admin/api/keys", corsHandler(handleAdminGetKeys))
-	mux.HandleFunc("/admin/api/keys/generate", corsHandler(handleAdminGenerateKey))
-	mux.HandleFunc("/admin/api/keys/delete", corsHandler(handleAdminDeleteKey))
-	mux.HandleFunc("/admin/api/models", corsHandler(handleAdminModels))
-	mux.HandleFunc("/admin/api/config", corsHandler(handleAdminConfig))
-	mux.HandleFunc("/admin/api/config/update", corsHandler(handleAdminUpdateConfig))
+	base := "/" + adminBasePath
+	mux.HandleFunc(base+"/login", handleAdminLogin)
+	mux.HandleFunc(base+"/logout", handleAdminLogout)
+	mux.HandleFunc(base+"/", adminAuth(adminStaticHandler))
+	mux.HandleFunc(base+"/api/accounts", corsHandler(adminAuth(handleAdminAccounts)))
+	mux.HandleFunc(base+"/api/accounts/add", corsHandler(adminAuth(handleAdminAccountAdd)))
+	mux.HandleFunc(base+"/api/accounts/delete", corsHandler(adminAuth(handleAdminAccountDelete)))
+	mux.HandleFunc(base+"/api/oauth/start", corsHandler(adminAuth(handleOAuthStart)))
+	mux.HandleFunc(base+"/api/oauth/status", corsHandler(adminAuth(handleOAuthStatus)))
+	mux.HandleFunc(base+"/api/sso/import", corsHandler(adminAuth(handleSSOImport)))
+	mux.HandleFunc(base+"/api/stats", corsHandler(adminAuth(handleAdminStats)))
+	mux.HandleFunc(base+"/api/batch-import", corsHandler(adminAuth(handleBatchImport)))
+	mux.HandleFunc(base+"/api/accounts/refresh-all", corsHandler(adminAuth(handleAdminRefreshAll)))
+	mux.HandleFunc(base+"/api/accounts/delete-all", corsHandler(adminAuth(handleAdminDeleteAll)))
+	mux.HandleFunc(base+"/api/accounts/reset", corsHandler(adminAuth(handleAdminAccountReset)))
+	mux.HandleFunc(base+"/api/keys", corsHandler(adminAuth(handleAdminGetKeys)))
+	mux.HandleFunc(base+"/api/keys/generate", corsHandler(adminAuth(handleAdminGenerateKey)))
+	mux.HandleFunc(base+"/api/keys/delete", corsHandler(adminAuth(handleAdminDeleteKey)))
+	mux.HandleFunc(base+"/api/models", corsHandler(adminAuth(handleAdminModels)))
+	mux.HandleFunc(base+"/api/config", corsHandler(adminAuth(handleAdminConfig)))
+	mux.HandleFunc(base+"/api/config/update", corsHandler(adminAuth(handleAdminUpdateConfig)))
 }
 
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/admin/" || r.URL.Path == "/admin" {
+	base := "/" + adminBasePath
+	if r.URL.Path == base+"/" || r.URL.Path == base {
+		// Rewrite the hardcoded /admin references in the embedded HTML
+		// (const API and the display link) to the configured base path.
+		html := strings.ReplaceAll(adminHTML, "/admin", base)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(adminHTML))
+		w.Write([]byte(html))
 		return
 	}
 	http.NotFound(w, r)
@@ -685,6 +844,7 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 	if changed {
 		setProxyConfig(cfg)
+		saveConfigToPool()
 	}
 
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{

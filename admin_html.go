@@ -97,9 +97,12 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
 <div class="nav-item" data-tab="accounts"><span>👤</span> 账号管理</div>
 <div class="nav-item" data-tab="import"><span>📥</span> 导入账号</div>
 <div class="nav-item" data-tab="settings"><span>⚙️</span> 设置</div>
-<div style="margin-top:auto;padding:16px;font-size:12px;color:var(--text2)">
+<div style="margin-top:auto">
+<div class="nav-item" onclick="if(confirm('确定退出登录?'))location.href='/admin/logout'"><span>🚪</span> 退出登录</div>
+<div style="padding:16px;font-size:12px;color:var(--text2)">
   <div>管理面板: <a href="/admin/" style="color:var(--accent)">/admin/</a></div>
   <div>API 地址: <span id="footerApiAddr">http://127.0.0.1:3457</span></div>
+</div>
 </div>
 </div>
 
@@ -306,7 +309,7 @@ function toast(msg, t) {
 }
 
 // ========== 导航 ==========
-document.querySelectorAll('.nav-item').forEach(el => {
+document.querySelectorAll('.nav-item[data-tab]').forEach(el => {
   el.addEventListener('click', () => {
     if (el.classList.contains('active')) return;
     document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));

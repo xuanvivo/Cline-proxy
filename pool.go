@@ -48,6 +48,19 @@ func loadPool() *AccountPool {
 		p.Keys = []string{}
 	}
 	pool = &p
+
+	// Restore persisted load-balancing config (survives restarts).
+	if p.Config != nil {
+		cfg := defaultProxyConfig()
+		if p.Config.Strategy != "" {
+			cfg.Strategy = p.Config.Strategy
+		}
+		if p.Config.Headers != nil {
+			cfg.Headers = p.Config.Headers
+		}
+		setProxyConfig(cfg)
+	}
+
 	return pool
 }
 
@@ -113,42 +126,111 @@ func refreshAccountToken(acc *Account) error {
 }
 
 func pickAccount() *Account {
+	if accs := pickAccounts(); len(accs) > 0 {
+		return accs[0]
+	}
+	return nil
+}
+
+// cooldownDuration is how long a rate-limited/failed account stays out of
+// rotation before pickAccounts automatically brings it back as active.
+const cooldownDuration = 5 * time.Minute
+
+// pickAccounts returns the active accounts in the order they should be tried
+// for the current request, according to the configured strategy. Cooldown
+// accounts whose cooldown has elapsed are automatically restored to active.
+// The returned slice is the failover order: callers try index 0, then 1, ...
+func pickAccounts() []*Account {
 	p := loadPool()
 	poolMu.Lock()
 	defer poolMu.Unlock()
 
-	active := make([]*Account, 0)
+	now := time.Now()
+	active := make([]*Account, 0, len(p.Accounts))
 	for _, a := range p.Accounts {
+		// Auto-recover elapsed cooldowns.
+		if a.Status == "cooldown" && !a.CooldownUntil.IsZero() && now.After(a.CooldownUntil) {
+			a.Status = "active"
+			a.CooldownUntil = time.Time{}
+			log.Printf("  account %s cooldown elapsed, back to active", truncateEmail(a.Email))
+		}
 		if a.Status == "active" {
 			active = append(active, a)
 		}
 	}
 
 	if len(active) == 0 {
+		savePool()
 		return nil
 	}
 
 	cfg := getProxyConfig()
+	ordered := make([]*Account, 0, len(active))
 
-	var acc *Account
 	switch cfg.Strategy {
 	case "fill":
-		// Always pick the first available (fill)
-		acc = active[0]
+		// Keep natural order: always drain active[0] first.
+		ordered = append(ordered, active...)
 	case "random":
-		// Random selection
-		n := time.Now().UnixNano() % int64(len(active))
-		acc = active[n]
+		// Shuffle so the primary pick is random; the rest form the failover tail.
+		perm := make([]*Account, len(active))
+		copy(perm, active)
+		for i := len(perm) - 1; i > 0; i-- {
+			j := int(now.UnixNano()>>uint(i%16)) % (i + 1)
+			if j < 0 {
+				j = -j % (i + 1)
+			}
+			perm[i], perm[j] = perm[j], perm[i]
+		}
+		ordered = append(ordered, perm...)
 	default: // round_robin
 		if p.CurrentIdx >= len(active) {
 			p.CurrentIdx = 0
 		}
-		acc = active[p.CurrentIdx]
-		p.CurrentIdx = (p.CurrentIdx + 1) % len(active)
+		start := p.CurrentIdx
+		ordered = append(ordered, active[start:]...)
+		ordered = append(ordered, active[:start]...)
+		p.CurrentIdx = (start + 1) % len(active)
 	}
 
 	savePool()
-	return acc
+	return ordered
+}
+
+// markCooldown puts an account out of rotation until cooldownDuration elapses.
+func markCooldown(acc *Account) {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	acc.Status = "cooldown"
+	acc.CooldownUntil = time.Now().Add(cooldownDuration)
+	savePool()
+}
+
+// markExpired marks an account's token as permanently failed (manual reset needed).
+func markExpired(acc *Account) {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	acc.Status = "expired"
+	savePool()
+}
+
+// markUsed records a successful upstream call.
+func markUsed(acc *Account) {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	acc.LastUsed = time.Now()
+	acc.UsageCount++
+	savePool()
+}
+
+// saveConfigToPool persists the current load-balancing config so it survives restarts.
+func saveConfigToPool() {
+	p := loadPool()
+	cfg := getProxyConfig()
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	p.Config = cfg
+	savePool()
 }
 
 func ensureAccountToken(acc *Account) (string, error) {

@@ -105,7 +105,7 @@ func buildAndStart(port int) {
 		fmt.Println("Proxy started.")
 	}
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/admin/", port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/%s/", port, adminBasePath)
 	fmt.Printf("\nAdmin panel: %s\n", url)
 
 	switch runtime.GOOS {
