@@ -231,8 +231,12 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
 </div>
 
 <div class="section">
-  <div class="section-title">🧠 可用模型</div>
+  <div class="section-title justify-between">
+    <span>🧠 可用模型（仅同步免费模型）</span>
+    <button class="btn btn-sm" id="syncModelsBtn" onclick="syncModels()">🔄 立即同步</button>
+  </div>
   <div class="section-body">
+    <div id="modelsSyncInfo" style="font-size:12px;color:var(--text2);margin-bottom:8px"></div>
     <div id="modelsList">加载中...</div>
   </div>
 </div>
@@ -241,8 +245,19 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
   <div class="section-title">🔧 代理配置</div>
   <div class="section-body">
     <div class="form-row">
+      <div class="field">
+        <label>默认模型</label>
+        <div class="flex">
+          <input type="text" id="settingDefModel" list="freeModelOptions" placeholder="留空 = 自动选择免费模型" style="flex:1" onkeydown="if(event.key==='Enter')saveDefaultModel()">
+          <button class="btn btn-primary" style="flex-shrink:0" onclick="saveDefaultModel()">💾 保存</button>
+        </div>
+        <datalist id="freeModelOptions"></datalist>
+        <div id="defModelHint" style="font-size:12px;color:var(--text2);margin-top:4px"></div>
+      </div>
+    </div>
+    <div class="form-row">
       <div class="field"><label>监听地址</label><input type="text" id="settingAddr" disabled></div>
-      <div class="field"><label>默认模型</label><input type="text" id="settingDefModel" disabled></div>
+      <div class="field"><label>引擎版本</label><input type="text" id="settingVersion" disabled></div>
     </div>
     <div class="form-row">
       <div class="field">
@@ -253,9 +268,6 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
           <option value="random">随机 (random)</option>
         </select>
       </div>
-      <div class="field"><label>引擎版本</label><input type="text" id="settingVersion" disabled></div>
-    </div>
-    <div class="form-row">
       <div class="field"><label>账号文件</label><input type="text" id="settingPoolPath" disabled></div>
     </div>
   </div>
@@ -330,7 +342,7 @@ function switchTab(name) {
   _('tab-' + name).style.display = 'block';
   if (name === 'dashboard') { loadStats(); loadAccounts(); }
   if (name === 'accounts') loadAccounts();
-  if (name === 'settings') { loadKeys(); loadModels(); }
+  if (name === 'settings') { loadKeys(); loadModels(); loadConfig(); }
 }
 
 // 导入子标签
@@ -626,14 +638,76 @@ async function saveHeaders() {
 }
 
 // ========== 模型列表 ==========
+let freeModelList = [];
+
 async function loadModels() {
   try {
     const d = await api('GET', '/models');
-    const models = d.data.models || [];
-    _('modelsList').innerHTML = models.map(m =>
-      '<span class="model-tag ' + (m.cost || 'free') + '">' + esc(m.id) + '</span>'
-    ).join('') || '<div class="empty">暂无模型</div>';
+    renderModels(d.data);
   } catch (e) { _('modelsList').textContent = '加载失败'; }
+}
+
+function renderModels(s) {
+  freeModelList = s.models || [];
+  const def = s.defaultModel || '';
+
+  let info = s.syncedAt ? '上次同步：' + new Date(s.syncedAt).toLocaleString('zh-CN') : '尚未同步成功，当前为内置列表';
+  info += ' · 每小时自动同步';
+  if (s.lastError) info += ' · 最近一次同步失败：' + s.lastError;
+  _('modelsSyncInfo').textContent = info;
+
+  // 模型信息来自上游，下拉选项用 DOM 构建，按钮用下标引用，不拼进 HTML 属性
+  const dl = _('freeModelOptions');
+  dl.innerHTML = '';
+  freeModelList.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m.id;
+    o.label = m.name;
+    dl.appendChild(o);
+  });
+
+  _('modelsList').innerHTML = freeModelList.length === 0 ? '<div class="empty">暂无模型</div>' :
+    '<table><thead><tr><th>模型 ID</th><th>名称</th><th>说明</th><th></th></tr></thead><tbody>' +
+    freeModelList.map((m, i) =>
+      '<tr>' +
+        '<td class="mono">' + esc(m.id) + '</td>' +
+        '<td>' + esc(m.name) + '</td>' +
+        '<td style="color:var(--text2);font-size:12px">' + esc(m.description) + '</td>' +
+        '<td class="text-right" style="white-space:nowrap">' + (m.id === def
+          ? '<span class="model-tag free">当前默认</span>'
+          : '<button class="btn btn-sm" onclick="saveDefaultModel(freeModelList[' + i + '].id)">设为默认</button>') +
+        '</td>' +
+      '</tr>'
+    ).join('') + '</tbody></table>';
+
+  const inList = freeModelList.some(m => m.id === def);
+  _('defModelHint').innerHTML = '客户端请求未指定模型时使用；留空则自动选用免费列表中的模型。当前生效：<span class="mono">' + esc(def) + '</span>' +
+    (inList ? '' : ' <span style="color:var(--yellow)">⚠️ 不在免费列表中，可能扣点数或已下线</span>');
+}
+
+async function syncModels() {
+  const btn = _('syncModelsBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="loading"></span> 同步中...';
+  try {
+    const d = await api('POST', '/models/sync');
+    renderModels(d.data);
+    toast('已同步 ' + (d.data.models || []).length + ' 个免费模型', 'success');
+  } catch (e) {
+    toast('同步失败: ' + e.message, 'error');
+    loadModels();
+  }
+  btn.disabled = false;
+  btn.innerHTML = '🔄 立即同步';
+}
+
+async function saveDefaultModel(model) {
+  const v = (model === undefined ? _('settingDefModel').value : model).trim();
+  try {
+    await api('POST', '/config/update', { defaultModel: v });
+    toast(v ? '默认模型已设为: ' + v : '默认模型已恢复为自动选择', 'success');
+    loadConfig(); loadModels();
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
 }
 
 // ========== 配置加载 ==========
@@ -645,7 +719,7 @@ async function loadConfig() {
     if (c.strategy) _('settingStrategy').value = c.strategy;
     if (c.version) _('settingVersion').value = c.version;
     if (c.poolPath) _('settingPoolPath').value = c.poolPath;
-    if (c.defaultModel) _('settingDefModel').value = c.defaultModel;
+    _('settingDefModel').value = c.defaultModel || '';
     if (c.headers) {
       const tbody = _('headersTableBody');
       tbody.innerHTML = Object.entries(c.headers).map(([k, v]) =>

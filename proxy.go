@@ -15,7 +15,6 @@ import (
 )
 
 const (
-	defaultModel          = "cline-free/glm-5.2"
 	defaultMaxTokens      = 128000
 	defaultReasoningEffort = "high"
 )
@@ -42,6 +41,7 @@ type chatRequest struct {
 
 func startProxy(port int) error {
 	p := loadPool()
+	startFreeModelSync()
 	activeCount := 0
 	for _, a := range p.Accounts {
 		if a.Status == "active" {
@@ -117,15 +117,13 @@ func startProxy(port int) error {
 		})
 	}
 
-	modelsList := []map[string]any{
-		{"id": "cline-free/glm-5.2", "object": "model", "created": time.Now().UnixMilli(), "owned_by": "cline"},
-		{"id": "cline-pass/glm-5.2", "object": "model", "created": time.Now().UnixMilli(), "owned_by": "cline"},
-		{"id": "cline-pass/deepseek-v4-flash", "object": "model", "created": time.Now().UnixMilli(), "owned_by": "cline"},
-		{"id": "cline-pass/qwen3.7-max", "object": "model", "created": time.Now().UnixMilli(), "owned_by": "cline"},
-	}
-
 	modelsHandler := apiKeyHandler(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": modelsList})
+		models := listFreeModels()
+		data := make([]map[string]any, 0, len(models))
+		for _, m := range models {
+			data = append(data, map[string]any{"id": m.ID, "object": "model", "created": time.Now().Unix(), "owned_by": "cline"})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	})
 	mux.HandleFunc("/v1/models", modelsHandler)
 	mux.HandleFunc("/models", modelsHandler)
@@ -234,7 +232,7 @@ func startProxy(port int) error {
 	fmt.Printf("  http://%s/v1\n", addr)
 	fmt.Printf("  Admin:   http://%s/%s/  (user: %s)\n", addr, adminBasePath, adminUser)
 	fmt.Println("  API Key: any value")
-	fmt.Printf("  Model:   %s\n", defaultModel)
+	fmt.Printf("  Model:   %s\n", currentDefaultModel())
 	fmt.Printf("  Accounts: %d total, %d active\n", len(loadPool().Accounts), activeCount)
 	fmt.Println(strings.Repeat("=", 58))
 
@@ -285,9 +283,9 @@ func buildUpstreamBody(params map[string]any, stream bool) map[string]any {
 		maxTokens = int(mt)
 	}
 
-	model := defaultModel
-	if m, ok := params["model"].(string); ok && m != "" {
-		model = m
+	model, _ := params["model"].(string)
+	if model == "" {
+		model = currentDefaultModel()
 	}
 
 	body := map[string]any{

@@ -318,6 +318,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(base+"/api/keys/generate", adminAuth(handleAdminGenerateKey))
 	mux.HandleFunc(base+"/api/keys/delete", adminAuth(handleAdminDeleteKey))
 	mux.HandleFunc(base+"/api/models", adminAuth(handleAdminModels))
+	mux.HandleFunc(base+"/api/models/sync", adminAuth(handleAdminSyncModels))
 	mux.HandleFunc(base+"/api/config", adminAuth(handleAdminConfig))
 	mux.HandleFunc(base+"/api/config/update", adminAuth(handleAdminUpdateConfig))
 }
@@ -805,8 +806,9 @@ var (
 )
 
 type proxyConfigData struct {
-	Strategy string            `json:"strategy"`
-	Headers  map[string]string `json:"headers"`
+	Strategy     string            `json:"strategy"`
+	Headers      map[string]string `json:"headers"`
+	DefaultModel string            `json:"defaultModel,omitempty"` // empty = auto (see currentDefaultModel)
 }
 
 func defaultProxyConfig() *proxyConfigData {
@@ -895,16 +897,17 @@ func handleAdminDeleteKey(w http.ResponseWriter, r *http.Request) {
 func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := getProxyConfig()
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"address":      "127.0.0.1:3457",
-		"strategy":     cfg.Strategy,
-		"version":      "go-1.1",
-		"poolPath":     poolPath,
-		"defaultModel": defaultModel,
-		"headers":      cfg.Headers,
+		"address":               "127.0.0.1:3457",
+		"strategy":              cfg.Strategy,
+		"version":               "go-1.1",
+		"poolPath":              poolPath,
+		"defaultModel":          cfg.DefaultModel,
+		"effectiveDefaultModel": currentDefaultModel(),
+		"headers":               cfg.Headers,
 	}})
 }
 
-// POST /admin/api/config  body: { strategy?, headers? }
+// POST /admin/api/config  body: { strategy?, headers?, defaultModel? }
 func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -918,15 +921,26 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	var req struct {
-		Strategy string            `json:"strategy"`
-		Headers  map[string]string `json:"headers"`
+		Strategy     string            `json:"strategy"`
+		Headers      map[string]string `json:"headers"`
+		DefaultModel *string           `json:"defaultModel"` // "" resets to auto
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
 		return
 	}
 
-	cfg := getProxyConfig()
+	// Copy-on-write: requests read the live config without holding the
+	// lock, so it (and its Headers map) must never be mutated in place.
+	old := getProxyConfig()
+	cfg := &proxyConfigData{
+		Strategy:     old.Strategy,
+		Headers:      make(map[string]string, len(old.Headers)),
+		DefaultModel: old.DefaultModel,
+	}
+	for k, v := range old.Headers {
+		cfg.Headers[k] = v
+	}
 	changed := false
 
 	if req.Strategy != "" {
@@ -947,26 +961,39 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		changed = true
 	}
 
+	if req.DefaultModel != nil {
+		cfg.DefaultModel = strings.TrimSpace(*req.DefaultModel)
+		changed = true
+	}
+
 	if changed {
 		setProxyConfig(cfg)
 		saveConfigToPool()
 	}
 
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"strategy": cfg.Strategy,
-		"headers":  cfg.Headers,
+		"strategy":     cfg.Strategy,
+		"headers":      cfg.Headers,
+		"defaultModel": cfg.DefaultModel,
 	}})
 }
 
 // GET /admin/api/models
 func handleAdminModels(w http.ResponseWriter, r *http.Request) {
-	models := []map[string]any{
-		{"id": "cline-free/glm-5.2", "provider": "zai", "cost": "free", "status": "active"},
-		{"id": "cline-pass/glm-5.2", "provider": "zai", "cost": "pass", "status": "active"},
-		{"id": "cline-pass/deepseek-v4-flash", "provider": "deepseek", "cost": "pass", "status": "active"},
-		{"id": "cline-pass/qwen3.7-max", "provider": "qwen", "cost": "pass", "status": "active"},
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: freeModelsStatus()})
+}
+
+// POST /admin/api/models/sync
+func handleAdminSyncModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
 	}
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"models": models}})
+	if err := syncFreeModels(); err != nil {
+		writeAPI(w, http.StatusBadGateway, apiResponse{Error: err.Error()})
+		return
+	}
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: freeModelsStatus()})
 }
 
 // GET /admin/api/stats

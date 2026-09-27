@@ -437,12 +437,12 @@ func doFullCapture() error {
 	fmt.Println("  PHASE 6: 测试 Chat API 请求")
 	fmt.Println(strings.Repeat("█", 72))
 
-	chatBody := `{
-		"model": "cline-free/glm-5.2",
+	chatBody := fmt.Sprintf(`{
+		"model": "%s",
 		"messages": [{"role":"user","content":"Hello, say hi"}],
 		"max_tokens": 100,
 		"stream": false
-	}`
+	}`, currentDefaultModel())
 
 	_, err = captureRequest(
 		"Cline Chat API Test",

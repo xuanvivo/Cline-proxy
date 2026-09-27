@@ -9,6 +9,7 @@ Cline API 的反向代理服务，支持多账号轮询、OpenAI 和 Anthropic M
 
 - **双协议兼容**：同时支持 `/v1/chat/completions`（OpenAI）和 `/v1/messages`（Anthropic Messages API）
 - **多账号轮询**：自动在多个 Cline 账号间切换负载（支持 `round_robin` / `fill` / `random` 策略）
+- **免费模型自动同步**：从 Cline 官方同步免费模型列表（每小时一次，也可手动同步），只收录不扣点数的免费模型；默认模型可在后台编辑
 - **中文管理后台**：浏览器访问管理路径即可管理账号、API Key、模型配置、请求头、代理设置
 - **后台登录页**：风格统一的深色登录页 + Cookie 会话（7 天有效），不再弹 Basic Auth 认证框；Basic Auth 仍保留，兼容 curl / 脚本调用；侧边栏提供退出登录
 - **公网部署加固**：管理路径、用户名、密码均可通过环境变量配置；登录失败 5 次锁定 IP 15 分钟，防止爆破
@@ -82,7 +83,7 @@ services:
 ```
 Base URL: http://127.0.0.1:3457/v1
 API Key:  <在管理后台生成的 Key>
-Model:    cline-free/glm-5.2
+Model:    cline-free/deepseek-v4.1-flash   # 任选后台「可用模型」中的免费模型
 ```
 
 OpenAI 格式（`/v1/chat/completions`）和 Anthropic 格式（`/v1/messages`）均可。
@@ -99,30 +100,31 @@ OpenAI 格式（`/v1/chat/completions`）和 Anthropic 格式（`/v1/messages`�
 
 后台 **设置** → **请求头** 可编辑转发给上游的自定义请求头（如 `x-client-type: cline-cli`）。
 
-## 可用模型（实测）
+## 可用模型（自动同步）
 
-### 消耗账户额度
+模型列表自动从 Cline 官方同步，**只同步免费模型**：
 
-| 模型 ID | 状态 | 说明 |
-|---------|:----:|------|
-| `deepseek/deepseek-v4-pro` | ✅ 可用 | DeepSeek V4 Pro |
-| `openai/gpt-4.1-nano` | ✅ 可用 | GPT-4.1 Nano |
-| `qwen/qwen3-235b-a22b` | ✅ 可用 | Qwen3 235B |
-| `meta-llama/llama-4-maverick` | ✅ 可用 | Llama 4 Maverick |
-| `deepseek/deepseek-v4-flash` | ⚠️ 响应为空 | API 返回 200 但内容为空 |
-| `google/gemini-2.5-flash` | ⚠️ 响应为空 | API 返回 200 但内容为空 |
-| `google/gemini-2.5-pro` | ⚠️ 响应为空 | API 返回 200 但内容为空 |
+- 数据来源：`https://api.cline.bot/api/v1/ai/cline/recommended-models` 的 `free` 分组，即官方 Cline 客户端模型选择器中「Free」栏目的模型
+- 不同步 OpenRouter 目录中带 `:free` 后缀的模型（名字带 free，但经 Cline 调用会扣点数）
+- 启动时同步一次，之后每小时自动同步；后台 **设置** → **可用模型** 可点「立即同步」；同步失败时保留上一次的列表
+- `/v1/models` 返回的就是同步后的免费模型列表
 
-### 不消耗账户额度
+截至 2026-09 的免费模型（仅供参考，以后台显示为准）：
 
-| 模型 ID | 状态 | 说明 |
-|---------|:----:|------|
-| `cline-free/glm-5.2` | ✅ 可用 | 免费模型，无限使用 |
-| `cline-pass/glm-5.2` | ❌ 403 | 需要 `cline-pass` 订阅 |
-| `cline-pass/deepseek-v4-flash` | ❌ 403 | 需要 `cline-pass` 订阅 |
-| `cline-pass/qwen3.7-max` | ❌ 403 | 需要 `cline-pass` 订阅 |
+| 模型 ID | 说明 |
+|---------|------|
+| `cline-free/mimo-v2.6-flash` | Mimo V2.6 Flash |
+| `cline-free/deepseek-v4.1-flash` | DeepSeek V4.1 Flash，1M 上下文 |
+| `cline-free/gemini-3.8-flash` | Gemini 3.8 Flash |
+| `cline-free/muse-spark-1.3-contributor` | Muse Spark 1.3 Contributor |
+| `stealth/pixel-canary` | 匿名预览模型 |
+| `stealth/space-bunny-alpha` | 匿名预览模型，1M 上下文 |
 
-可在后台 **设置** → **默认模型** 中修改默认模型。
+代理不限制模型：客户端也可以直接指定付费模型 ID（如 `anthropic/claude-opus-5`），但会扣账户点数；`cline-pass/*` 需要 Cline Pass 订阅。
+
+### 默认模型
+
+在后台 **设置** → **代理配置** → **默认模型** 中编辑（或在模型列表中点「设为默认」），保存后立即生效并持久化。客户端请求未指定 `model` 时使用该模型；留空则自动选用免费列表中第一个 `cline-free/` 模型。
 
 ## 项目结构
 
@@ -134,6 +136,7 @@ OpenAI 格式（`/v1/chat/completions`）和 Anthropic 格式（`/v1/messages`�
 ├── login_html.go       登录页 HTML（嵌入 Go 二进制）
 ├── auth.go             WorkOS OAuth 登录与 Token 刷新
 ├── pool.go             账号池管理、持久化、策略轮询
+├── models.go           免费模型列表同步、默认模型选择
 ├── types.go            数据结构定义
 ├── capture.go          OAuth 信息捕获工具
 ├── http.go             HTTP 客户端与工具函数

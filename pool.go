@@ -58,6 +58,7 @@ func loadPool() *AccountPool {
 		if p.Config.Headers != nil {
 			cfg.Headers = p.Config.Headers
 		}
+		cfg.DefaultModel = p.Config.DefaultModel
 		setProxyConfig(cfg)
 	}
 
