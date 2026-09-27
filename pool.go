@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -31,14 +34,20 @@ func loadPool() *AccountPool {
 
 	data, err := os.ReadFile(poolPath)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			// Carrying on with an empty pool would overwrite the file on the next save.
+			log.Fatalf("Cannot read accounts file %s: %v%s", poolPath, err, storageHint(poolPath))
+		}
 		pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
 		return pool
 	}
 
 	var p AccountPool
-	if err := json.Unmarshal(data, &p); err != nil {
-		pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
-		return pool
+	// An empty file (e.g. created with touch before the first start) is a fresh pool.
+	if len(bytes.TrimSpace(data)) > 0 {
+		if err := json.Unmarshal(data, &p); err != nil {
+			log.Fatalf("Accounts file %s is not valid JSON (%v); refusing to start so it isn't overwritten. Fix it, or move it away to start with an empty pool.", poolPath, err)
+		}
 	}
 
 	if p.Accounts == nil {
@@ -65,11 +74,89 @@ func loadPool() *AccountPool {
 	return pool
 }
 
-func savePool() {
-	data, _ := json.MarshalIndent(pool, "", "  ")
-	if err := os.WriteFile(poolPath, data, 0600); err != nil {
+var (
+	saveMu      sync.Mutex // serializes pool writes; taken at exit so none is cut off
+	inPlaceSave bool       // set once replacing poolPath via rename has failed
+)
+
+// savePool writes the pool to disk, replacing the file atomically when
+// possible so a crash can't leave it truncated. A Docker single-file bind
+// mount can't be replaced by rename (EBUSY), so it is then written in place.
+func savePool() error {
+	saveMu.Lock()
+	defer saveMu.Unlock()
+	data, err := json.MarshalIndent(pool, "", "  ")
+	if err == nil {
+		err = writePoolFile(data)
+	}
+	if err != nil {
 		log.Printf("Failed to save accounts: %v", err)
 	}
+	return err
+}
+
+func writePoolFile(data []byte) error {
+	if !inPlaceSave {
+		tmp, err := os.CreateTemp(filepath.Dir(poolPath), ".cline-accounts-*.tmp")
+		if err == nil {
+			_, err = tmp.Write(data)
+			if err == nil {
+				err = tmp.Sync()
+			}
+			if cerr := tmp.Close(); err == nil {
+				err = cerr
+			}
+			if err == nil {
+				err = os.Rename(tmp.Name(), poolPath)
+			}
+			if err == nil {
+				return nil
+			}
+			os.Remove(tmp.Name())
+		}
+		log.Printf("Atomic save unavailable for %s (%v), writing in place", poolPath, err)
+		inPlaceSave = true
+	}
+	return os.WriteFile(poolPath, data, 0600)
+}
+
+// checkStorage fails fast when the accounts file can't be written, instead of
+// serving with accounts that silently live only in memory until a restart.
+func checkStorage() {
+	for _, f := range []string{sessionsFile, overrideFile} {
+		if hint := storageHint(f); hint != "" {
+			log.Printf("WARNING: %s is unusable:%s", f, hint)
+		}
+	}
+	if err := savePool(); err != nil {
+		log.Fatalf("Cannot write accounts file %s: %v%s", poolPath, err, storageHint(poolPath))
+	}
+}
+
+// storageHint explains the usual cause when a data file path is a directory:
+// Docker bind-mounting a file that doesn't exist on the host yet creates an
+// empty directory in its place.
+func storageHint(path string) string {
+	if fi, err := os.Stat(path); err != nil || !fi.IsDir() {
+		return ""
+	}
+	return "\n  " + path + " is a directory, not a file. Docker creates one when a bind-mounted file doesn't exist on the host yet." +
+		"\n  Fix it in the compose directory on the host:" +
+		"\n    docker compose down" +
+		"\n    for f in .cline-accounts.json .admin-sessions.json override.md; do [ -d \"$f\" ] && rmdir \"$f\"; touch \"$f\"; done" +
+		"\n    docker compose up -d"
+}
+
+// exitOnSignal lets an in-flight pool write finish before exiting on
+// SIGTERM/SIGINT (docker stop, Ctrl+C), so shutdown never truncates the file.
+func exitOnSignal() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, os.Interrupt)
+	go func() {
+		<-ch
+		saveMu.Lock()
+		os.Exit(0)
+	}()
 }
 
 func addAccount(acc *Account) {

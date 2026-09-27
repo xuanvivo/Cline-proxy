@@ -16,7 +16,7 @@ Cline API 的反向代理服务，支持多账号轮询、OpenAI 和 Anthropic M
 - **API Key 鉴权**：保护代理端点，支持生成/删除多个 API Key
 - **System Prompt 覆盖**：项目目录下放 `override.md` 则自动替换系统提示词，不存在则使用客户端自带
 - **账号导入**：支持 OAuth 浏览器登录、手动 Token 输入、批量文件导入
-- **持久化存储**：账号和 Key 保存在 `.cline-accounts.json`
+- **持久化存储**：账号、Key 和后台设置保存在 `.cline-accounts.json`；文件无法写入（如 Docker 把它建成了目录）或内容损坏时拒绝启动并提示修复方法，不会让数据只存在内存里、重启后丢失
 
 ## 快速开始
 
@@ -36,10 +36,23 @@ go build -o cline-proxy .
 ### Docker 部署
 
 ```bash
+# 首次部署前先建好这三个文件（必须）：宿主机上不存在时，Docker 会把挂载点建成同名目录，账号数据就无法保存
+touch .cline-accounts.json .admin-sessions.json override.md
+
 docker compose up -d      # 构建并启动
 docker compose logs -f    # 查看日志
 docker compose down       # 停止
 ```
+
+如果日志提示 `.cline-accounts.json is a directory, not a file`，说明之前没建文件、Docker 建成了目录。在项目目录执行：
+
+```bash
+docker compose down
+for f in .cline-accounts.json .admin-sessions.json override.md; do [ -d "$f" ] && rmdir "$f"; touch "$f"; done
+docker compose up -d
+```
+
+更新代码：`git pull && docker compose up -d --build`，账号数据保存在宿主机文件里，重建容器不受影响。
 
 公网部署时，新建 `docker-compose.override.yml`（已被 `.gitignore` 排除，不会提交）覆盖默认凭据：
 

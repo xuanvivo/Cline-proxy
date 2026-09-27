@@ -41,6 +41,8 @@ type chatRequest struct {
 
 func startProxy(port int) error {
 	p := loadPool()
+	checkStorage()
+	exitOnSignal()
 	startFreeModelSync()
 	activeCount := 0
 	for _, a := range p.Accounts {
@@ -583,8 +585,10 @@ type anthropicReq struct {
 	Extra       map[string]any  `json:"-"`
 }
 
+const overrideFile = "override.md"
+
 func loadOverrideContent() string {
-	data, err := os.ReadFile("override.md")
+	data, err := os.ReadFile(overrideFile)
 	if err != nil {
 		log.Printf("  override.md not found: %v", err)
 		return ""

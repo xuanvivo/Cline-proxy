@@ -754,8 +754,11 @@ func handleAdminDeleteAll(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 		return
 	}
+	// Only the accounts: API keys and settings share the pool file and must survive.
+	p := loadPool()
 	poolMu.Lock()
-	pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
+	p.Accounts = []*Account{}
+	p.CurrentIdx = 0
 	poolMu.Unlock()
 	savePool()
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "All accounts deleted"})
@@ -955,9 +958,9 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Headers != nil {
-		for k, v := range req.Headers {
-			cfg.Headers[k] = v
-		}
+		// Replace, not merge: the panel sends its whole table, so a row the
+		// user deleted there must be dropped here too.
+		cfg.Headers = req.Headers
 		changed = true
 	}
 
@@ -1023,7 +1026,7 @@ func handleAdminStats(w http.ResponseWriter, r *http.Request) {
 			"active":   active,
 			"cooldown": cooldown,
 			"expired":  expired,
-			"strategy": "round_robin",
+			"strategy": getProxyConfig().Strategy,
 			"version":  "go-1.1",
 		},
 	})
