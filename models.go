@@ -29,12 +29,13 @@ type freeModel struct {
 }
 
 // builtinFreeModels seeds the list until the first successful sync
-// (the feed's cline-free/ models as of 2026-09).
+// (the feed's free group as of 2026-10-23).
 var builtinFreeModels = []freeModel{
-	{ID: "cline-free/mimo-v2.6-flash", Name: "Mimo V2.6 Flash", Description: "Mixture-of-Experts architecture with 309B total parameters"},
-	{ID: "cline-free/deepseek-v4.1-flash", Name: "Deepseek-v4.1-Flash", Description: "Fast and efficient with 1M context window"},
-	{ID: "cline-free/gemini-3.8-flash", Name: "Gemini 3.8 Flash", Description: "Google's most intelligent Flash model"},
-	{ID: "cline-free/muse-spark-1.3-contributor", Name: "Muse Spark 1.3 Contributor", Description: "Meta's multimodal reasoning model for experimentation, learning, and early-stage agentic, multi-agent, and coding workflows."},
+	{ID: "reflection/beam-free", Name: "Beam"},
+	{ID: "cline-free/nemotron-3.5-super-vl", Name: "Nemotron 3.5 Super VL", Description: "NVIDIA's latest model with 120B and fast output"},
+	{ID: "nvidia/nemotron-3.5-lightning-free", Name: "Nemotron 3.5 Lightning"},
+	{ID: "poolside/laguna-s-2.1-free", Name: "Laguna S 2.1"},
+	{ID: "cline-free/solar-mini4", Name: "Solar Mini 4", Description: "Compact 35-billion parameter mixture-of-experts"},
 }
 
 var (

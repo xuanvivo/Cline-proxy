@@ -7,17 +7,27 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"time"
 )
 
 func main() {
+	defaultPort, err := strconv.Atoi(envOr("PORT", "3457"))
+	if err != nil || defaultPort < 1 || defaultPort > 65535 {
+		log.Fatal("PORT must be a number between 1 and 65535")
+	}
+	showVersion := flag.Bool("version", false, "Print proxy version and build information")
 	loginMode := flag.Bool("login", false, "Run OAuth device login flow and add account to pool")
 	captureMode := flag.Bool("capture", false, "Run interactive OAuth capture (records ALL traffic)")
-	port := flag.Int("port", 3457, "Proxy server port")
+	port := flag.Int("port", defaultPort, "Proxy server port")
 	addAccount := flag.Bool("add-account", false, "Add a new account via OAuth to the pool")
 	showList := flag.Bool("list", false, "List all accounts in the pool")
 	startMode := flag.Bool("start", false, "Build, start proxy, and open admin panel in browser")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("Cline Go Proxy v%s (commit %s, built %s)\n", appVersion, buildCommit, buildTime)
+		return
+	}
 
 	if *startMode {
 		buildAndStart(*port)
@@ -94,7 +104,7 @@ func buildAndStart(port int) {
 		fmt.Println("Proxy is already running.")
 	} else {
 		fmt.Println("Starting proxy...")
-		startCmd := exec.Command(exe)
+		startCmd := exec.Command(exe, "-port", strconv.Itoa(port))
 		startCmd.Stdout = os.Stdout
 		startCmd.Stderr = os.Stderr
 		if err := startCmd.Start(); err != nil {

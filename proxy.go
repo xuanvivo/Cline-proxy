@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -15,7 +14,7 @@ import (
 )
 
 const (
-	defaultMaxTokens      = 128000
+	defaultMaxTokens       = 128000
 	defaultReasoningEffort = "high"
 )
 
@@ -27,16 +26,16 @@ var passThroughKeys = []string{
 }
 
 type chatRequest struct {
-	Model       string          `json:"model"`
-	Messages    json.RawMessage `json:"messages"`
-	Stream      bool            `json:"stream,omitempty"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int    `json:"max_completion_tokens,omitempty"`
-	Tools       json.RawMessage `json:"tools,omitempty"`
-	ToolChoice  json.RawMessage `json:"tool_choice,omitempty"`
-	ReasoningEffort string     `json:"reasoning_effort,omitempty"`
-	ReasoningEffortAlt string  `json:"reasoningEffort,omitempty"`
-	Extra       map[string]any `json:"-"`
+	Model               string          `json:"model"`
+	Messages            json.RawMessage `json:"messages"`
+	Stream              bool            `json:"stream,omitempty"`
+	MaxTokens           int             `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
+	Tools               json.RawMessage `json:"tools,omitempty"`
+	ToolChoice          json.RawMessage `json:"tool_choice,omitempty"`
+	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
+	ReasoningEffortAlt  string          `json:"reasoningEffort,omitempty"`
+	Extra               map[string]any  `json:"-"`
 }
 
 func startProxy(port int) error {
@@ -44,6 +43,7 @@ func startProxy(port int) error {
 	checkStorage()
 	exitOnSignal()
 	startFreeModelSync()
+	startVersionChecks()
 	activeCount := 0
 	for _, a := range p.Accounts {
 		if a.Status == "active" {
@@ -59,25 +59,34 @@ func startProxy(port int) error {
 	}
 	log.Printf("Loaded %d active accounts from pool", activeCount)
 
-	freePort(port)
+	listenAddress = fmt.Sprintf("0.0.0.0:%d", port)
+	server := &http.Server{
+		Addr: listenAddress, Handler: newProxyMux(),
+		ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute,
+	}
+	log.Printf("Cline Go Proxy v%s (%s) listening on %s; %d active accounts", appVersion, buildCommit, listenAddress, activeCount)
+	return server.ListenAndServe()
+}
 
-	mux := http.NewServeMux()
+var listenAddress = "0.0.0.0:3457"
 
-	mux.HandleFunc("/v1/health", corsHandler(func(w http.ResponseWriter, r *http.Request) {
-		info := map[string]any{
-			"status":       "ok",
-			"version":      "go-1.1",
-			"activeAccounts": activeCount,
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	active := 0
+	for _, account := range listAccounts() {
+		if account.Status == "active" {
+			active++
 		}
-		writeJSON(w, http.StatusOK, info)
-	}))
-	mux.HandleFunc("/health", corsHandler(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status":         "ok",
-			"version":        "go-1.1",
-			"activeAccounts": activeCount,
-		})
-	}))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok", "version": appVersion, "buildCommit": buildCommit,
+		"buildTime": buildTime, "activeAccounts": active,
+	})
+}
+
+func newProxyMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/health", corsHandler(handleHealth))
+	mux.HandleFunc("/health", corsHandler(handleHealth))
 
 	// Admin API (frontend + REST)
 	registerAdminRoutes(mux)
@@ -135,7 +144,7 @@ func startProxy(port int) error {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-		if activeCount == 0 && len(loadPool().Accounts) == 0 {
+		if len(listAccounts()) == 0 {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"error": map[string]string{
 					"message": "No accounts in pool. Run with --add-account or POST /admin/login to add accounts.",
@@ -220,25 +229,7 @@ func startProxy(port int) error {
 	mux.HandleFunc("/v1/messages", anthropicHandler)
 	mux.HandleFunc("/messages", anthropicHandler)
 
-	addr := fmt.Sprintf(":%d", port)
-	server := &http.Server{
-		Addr:    addr,
-		Handler: mux,
-	}
-
-	fmt.Println("")
-	fmt.Println(strings.Repeat("=", 58))
-	fmt.Println("  Cline Go Proxy v1.0 - No CLI Required")
-	fmt.Println(strings.Repeat("=", 58))
-	fmt.Printf("  http://%s\n", addr)
-	fmt.Printf("  http://%s/v1\n", addr)
-	fmt.Printf("  Admin:   http://%s/%s/  (user: %s)\n", addr, adminBasePath, adminUser)
-	fmt.Println("  API Key: any value")
-	fmt.Printf("  Model:   %s\n", currentDefaultModel())
-	fmt.Printf("  Accounts: %d total, %d active\n", len(loadPool().Accounts), activeCount)
-	fmt.Println(strings.Repeat("=", 58))
-
-	return server.ListenAndServe()
+	return mux
 }
 
 func corsHandler(h http.HandlerFunc) http.HandlerFunc {
@@ -291,9 +282,9 @@ func buildUpstreamBody(params map[string]any, stream bool) map[string]any {
 	}
 
 	body := map[string]any{
-		"model":        model,
-		"max_tokens":   maxTokens,
-		"session_id":   sessionID,
+		"model":            model,
+		"max_tokens":       maxTokens,
+		"session_id":       sessionID,
 		"reasoning_effort": defaultReasoningEffort,
 	}
 
@@ -500,7 +491,7 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response) {
 			// Try to normalize the response
 			var obj map[string]any
 			if err := json.Unmarshal([]byte(payload), &obj); err == nil {
-				// Some Cline responses wrap in {data: {...}} 
+				// Some Cline responses wrap in {data: {...}}
 				if data, ok := obj["data"]; ok {
 					if d, ok := data.(map[string]any); ok {
 						if _, hasChoices := d["choices"]; hasChoices {
@@ -756,10 +747,10 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 
 func openAIToAnthropic(openAI map[string]any) map[string]any {
 	out := map[string]any{
-		"id":      "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
-		"type":    "message",
-		"role":    "assistant",
-		"model":   getNested(openAI, "model"),
+		"id":    "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
+		"type":  "message",
+		"role":  "assistant",
+		"model": getNested(openAI, "model"),
 	}
 
 	choices := getNested(openAI, "choices")
@@ -1228,19 +1219,4 @@ func getNested(obj map[string]any, keys ...any) any {
 		}
 	}
 	return current
-}
-
-func freePort(port int) {
-	addr := fmt.Sprintf(":%d", port)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		return // port is free
-	}
-	conn.Close()
-
-	// Try to kill the process using the port
-	cmd := execCommand("powershell", "-Command",
-		fmt.Sprintf(`$p=Get-NetTCPConnection -LocalPort %d -ErrorAction SilentlyContinue; if($p){Stop-Process -Id $p.OwningProcess -Force}`, port))
-	_ = cmd.Run()
-	time.Sleep(500 * time.Millisecond)
 }

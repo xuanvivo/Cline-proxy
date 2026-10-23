@@ -14,9 +14,9 @@ import (
 )
 
 var (
-	pool      *AccountPool
-	poolMu    sync.Mutex
-	poolPath  string
+	pool     *AccountPool
+	poolMu   sync.Mutex
+	poolPath string
 )
 
 func init() {
@@ -65,10 +65,11 @@ func loadPool() *AccountPool {
 			cfg.Strategy = p.Config.Strategy
 		}
 		if p.Config.Headers != nil {
-			cfg.Headers = p.Config.Headers
+			cfg.Headers = migrateLegacyHeaders(p.Config.Headers)
 		}
 		cfg.DefaultModel = p.Config.DefaultModel
 		setProxyConfig(cfg)
+		p.Config = cfg
 	}
 
 	return pool
@@ -312,13 +313,18 @@ func markUsed(acc *Account) {
 }
 
 // saveConfigToPool persists the current load-balancing config so it survives restarts.
-func saveConfigToPool() {
+func saveConfigToPool() error {
 	p := loadPool()
 	cfg := getProxyConfig()
 	poolMu.Lock()
 	defer poolMu.Unlock()
+	old := p.Config
 	p.Config = cfg
-	savePool()
+	if err := savePool(); err != nil {
+		p.Config = old
+		return err
+	}
+	return nil
 }
 
 func ensureAccountToken(acc *Account) (string, error) {
@@ -354,7 +360,7 @@ func listAccounts() []*Account {
 }
 
 func addAccountFromDeviceAuth() (*Account, error) {
-	fmt.Println("\n=== Add New Cline Account (OAuth) ===\n")
+	fmt.Print("\n=== Add New Cline Account (OAuth) ===\n\n")
 
 	device, err := workosDeviceAuth()
 	if err != nil {
@@ -369,7 +375,7 @@ func addAccountFromDeviceAuth() (*Account, error) {
 	fmt.Println("  1. Open this URL in your browser:")
 	fmt.Println("     " + authURL)
 	fmt.Println("  2. Enter code: " + device.UserCode)
-	fmt.Println("  3. Log in with Google, GitHub, or email\n")
+	fmt.Print("  3. Log in with Google, GitHub, or email\n\n")
 
 	_ = openBrowser(authURL)
 	fmt.Println("  Waiting for authorization...")

@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-var execCommand = exec.Command
-
 var httpTransport = &http.Transport{
 	MaxIdleConns:        100,
 	MaxIdleConnsPerHost: 10,

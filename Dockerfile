@@ -1,12 +1,13 @@
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27.3-alpine AS builder
 
 WORKDIR /build
 COPY go.mod ./
-RUN go mod download 2>/dev/null || true
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o cline-proxy .
+ARG BUILD_COMMIT=unknown
+ARG BUILD_TIME=unknown
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.buildCommit=${BUILD_COMMIT} -X main.buildTime=${BUILD_TIME}" -o cline-proxy .
 
-FROM alpine:3.21
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
@@ -16,5 +17,7 @@ EXPOSE 3457
 
 ENV PORT=3457
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD wget -q -O /dev/null "http://127.0.0.1:${PORT}/health" || exit 1
+
 ENTRYPOINT ["/app/cline-proxy"]
-CMD ["-port", "3457"]

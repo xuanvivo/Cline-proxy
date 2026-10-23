@@ -1,0 +1,12 @@
+.git
+.github
+.env
+.env.*
+.cline-*.json
+.admin-sessions.json
+docker-compose.override.yml
+override.md
+capture-logs
+cline-proxy
+cline-proxy.exe
+*.tmp

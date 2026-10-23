@@ -1,18 +1,30 @@
-version: "3.9"
-
 services:
   cline-proxy:
     build: .
     container_name: cline-proxy
     restart: unless-stopped
     ports:
-      - "3457:3457"
+      - "${HOST_PORT:-3457}:3457"
     volumes:
-      - ./.cline-accounts.json:/app/.cline-accounts.json
-      - ./.admin-sessions.json:/app/.admin-sessions.json
-      - ./override.md:/app/override.md:ro
+      - type: bind
+        source: ./.cline-accounts.json
+        target: /app/.cline-accounts.json
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.admin-sessions.json
+        target: /app/.admin-sessions.json
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./override.md
+        target: /app/override.md
+        read_only: true
+        bind:
+          create_host_path: false
     environment:
       - PORT=3457
+      - VERSION_CHECK_ENABLED=true
       # 实际部署凭据放在 docker-compose.override.yml（已 gitignore），不要提交到仓库
       - ADMIN_PATH=admin
       - ADMIN_USER=admin

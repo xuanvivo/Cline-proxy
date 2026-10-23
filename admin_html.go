@@ -242,6 +242,25 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
 </div>
 
 <div class="section">
+  <div class="section-title">
+    <span>🔄 版本更新</span>
+    <button class="btn btn-sm" id="checkVersionBtn" onclick="checkVersions()">立即检测</button>
+  </div>
+  <div class="section-body">
+    <div id="versionCheckInfo" style="font-size:12px;color:var(--text2);margin-bottom:8px">加载中...</div>
+    <table>
+      <thead><tr><th>组件</th><th>当前版本</th><th>最新稳定版</th><th>检测状态</th></tr></thead>
+      <tbody id="versionTableBody"></tbody>
+    </table>
+    <div class="form-actions" style="margin-top:12px">
+      <button class="btn btn-sm btn-primary" id="applyClientVersionBtn" onclick="applyClientVersion()" disabled>应用最新 CLI 请求头</button>
+      <a class="btn btn-sm" href="https://github.com/xuanvivo/Cline-proxy/releases" target="_blank" rel="noopener noreferrer">代理发行说明 ↗</a>
+    </div>
+    <div id="versionBuildInfo" style="font-size:12px;color:var(--text2);margin-top:8px"></div>
+  </div>
+</div>
+
+<div class="section">
   <div class="section-title">🔧 代理配置</div>
   <div class="section-body">
     <div class="form-row">
@@ -311,7 +330,7 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
 const API = '/admin/api';
 
 const _ = id => document.getElementById(id);
-const esc = s => { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; };
+const esc = s => { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;'); };
 
 function toast(msg, t) {
   const el = _('toast');
@@ -330,7 +349,7 @@ document.querySelectorAll('.nav-item[data-tab]').forEach(el => {
     _('tab-' + el.dataset.tab).style.display = 'block';
     if (el.dataset.tab === 'dashboard') { loadStats(); loadAccounts(); }
     if (el.dataset.tab === 'accounts') loadAccounts();
-    if (el.dataset.tab === 'settings') { loadKeys(); loadModels(); loadConfig(); }
+    if (el.dataset.tab === 'settings') { loadKeys(); loadModels(); loadConfig(); loadVersions(); }
   });
 });
 
@@ -342,7 +361,7 @@ function switchTab(name) {
   _('tab-' + name).style.display = 'block';
   if (name === 'dashboard') { loadStats(); loadAccounts(); }
   if (name === 'accounts') loadAccounts();
-  if (name === 'settings') { loadKeys(); loadModels(); loadConfig(); }
+  if (name === 'settings') { loadKeys(); loadModels(); loadConfig(); loadVersions(); }
 }
 
 // 导入子标签
@@ -710,6 +729,52 @@ async function saveDefaultModel(model) {
   } catch (e) { toast('保存失败: ' + e.message, 'error'); }
 }
 
+// ========== 版本检测 ==========
+function renderVersions(data) {
+  const hours = Math.round(data.intervalSeconds / 3600);
+  _('versionCheckInfo').textContent = (data.enabled ? '启动时及每 ' + hours + ' 小时自动检测。' : '自动检测已关闭，可手动检测。') +
+    '手动检测缓存 5 分钟；检测只读取发布信息。应用按钮会更新 CLI 身份请求头并保存，代理程序升级请按发行说明操作。';
+  const tbody = _('versionTableBody');
+  tbody.replaceChildren();
+  [['代理项目', data.proxy], ['Cline CLI', data.client]].forEach(([label, info]) => {
+    const row = document.createElement('tr');
+    [label, info.current || '未配置', info.latest ? info.latest.version : '待检测'].forEach(value => {
+      const cell = document.createElement('td'); cell.textContent = value; row.appendChild(cell);
+    });
+    const cell = document.createElement('td');
+    cell.textContent = info.lastError ? '检测失败：' + info.lastError :
+      !info.checkedAt ? '等待首次检测' : info.updateAvailable ? '有新版本' : info.latest && info.current === info.latest.version ? '已是最新版本' : '检测完成';
+    if (info.checkedAt) cell.title = '最近检测：' + new Date(info.checkedAt).toLocaleString();
+    row.appendChild(cell); tbody.appendChild(row);
+  });
+  _('applyClientVersionBtn').disabled = !data.client.latest;
+  _('versionBuildInfo').textContent = '构建提交：' + data.buildCommit + ' · 构建时间：' + data.buildTime;
+}
+
+async function loadVersions() {
+  try { const d = await api('GET', '/version'); renderVersions(d.data); }
+  catch (e) { _('versionCheckInfo').textContent = '无法读取版本状态：' + e.message; }
+}
+
+async function checkVersions() {
+  const btn = _('checkVersionBtn'); btn.disabled = true; btn.textContent = '检测中...';
+  try {
+    const d = await api('POST', '/version/check'); renderVersions(d.data);
+    const errors = [d.data.proxy.lastError, d.data.client.lastError].filter(Boolean);
+    toast(errors.length ? '部分版本检测失败，请查看检测状态' : '版本检测完成（5 分钟内复用结果）', errors.length ? 'error' : 'success');
+  } catch (e) { toast('检测失败：' + e.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = '立即检测'; }
+}
+
+async function applyClientVersion() {
+  const btn = _('applyClientVersionBtn'); btn.disabled = true;
+  try {
+    const d = await api('POST', '/version/apply-client'); renderVersions(d.data);
+    await loadConfig(); toast('最新 CLI 请求头已保存', 'success');
+  } catch (e) { toast('应用失败：' + e.message, 'error'); }
+  finally { loadVersions(); }
+}
+
 // ========== 配置加载 ==========
 async function loadConfig() {
   try {
@@ -739,6 +804,9 @@ loadAccounts();
 loadKeys();
 loadModels();
 loadConfig();
+loadVersions();
+setInterval(() => { loadVersions(); }, 60000);
+setTimeout(loadVersions, 5000);
 setInterval(() => { loadStats(); }, 10000);
 </script>
 </body>

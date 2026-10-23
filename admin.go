@@ -284,10 +284,10 @@ type oauthSessionState struct {
 }
 
 type apiResponse struct {
-	Success bool        `json:"success"`
-	Data    any         `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
-	Message string      `json:"message,omitempty"`
+	Success bool   `json:"success"`
+	Data    any    `json:"data,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 func writeAPI(w http.ResponseWriter, status int, resp apiResponse) {
@@ -321,6 +321,9 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(base+"/api/models/sync", adminAuth(handleAdminSyncModels))
 	mux.HandleFunc(base+"/api/config", adminAuth(handleAdminConfig))
 	mux.HandleFunc(base+"/api/config/update", adminAuth(handleAdminUpdateConfig))
+	mux.HandleFunc(base+"/api/version", adminAuth(handleAdminVersion))
+	mux.HandleFunc(base+"/api/version/check", adminAuth(handleAdminCheckVersion))
+	mux.HandleFunc(base+"/api/version/apply-client", adminAuth(handleAdminApplyClientVersion))
 }
 
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
@@ -347,9 +350,9 @@ func handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
 		Data: map[string]any{
-			"accounts":   accounts,
-			"total":      len(accounts),
-			"poolIndex":  loadPool().CurrentIdx,
+			"accounts":  accounts,
+			"total":     len(accounts),
+			"poolIndex": loadPool().CurrentIdx,
 		},
 	})
 }
@@ -815,19 +818,13 @@ type proxyConfigData struct {
 }
 
 func defaultProxyConfig() *proxyConfigData {
+	headers := clientIdentityHeaders(defaultClientVersion, defaultCoreVersion)
+	headers["HTTP-Referer"] = "https://cline.bot"
+	headers["X-Title"] = "Cline"
+	headers["X-IS-MULTIROOT"] = "false"
 	return &proxyConfigData{
 		Strategy: "round_robin",
-		Headers: map[string]string{
-			"User-Agent":         "Cline/3.0.47",
-			"HTTP-Referer":       "https://cline.bot",
-			"X-Title":            "Cline",
-			"X-IS-MULTIROOT":     "false",
-			"X-CLIENT-TYPE":      "cline-cli",
-			"X-CLIENT-VERSION":   "3.0.47",
-			"X-PLATFORM":         "terminal",
-			"X-PLATFORM-VERSION": "3.0.47",
-			"X-CORE-VERSION":     "0.0.66",
-		},
+		Headers:  headers,
 	}
 }
 
@@ -855,7 +852,12 @@ func handleAdminGenerateKey(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 		return
 	}
-	key := fmt.Sprintf("cline_%x_%x", time.Now().UnixMilli(), time.Now().UnixNano()%1000000)
+	token, err := newSessionToken()
+	if err != nil {
+		writeAPI(w, http.StatusInternalServerError, apiResponse{Error: "cannot generate API key"})
+		return
+	}
+	key := "cline_" + token
 	p := loadPool()
 	poolMu.Lock()
 	p.Keys = append(p.Keys, key)
@@ -900,9 +902,9 @@ func handleAdminDeleteKey(w http.ResponseWriter, r *http.Request) {
 func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := getProxyConfig()
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"address":               "127.0.0.1:3457",
+		"address":               listenAddress,
 		"strategy":              cfg.Strategy,
-		"version":               "go-1.1",
+		"version":               appVersion,
 		"poolPath":              poolPath,
 		"defaultModel":          cfg.DefaultModel,
 		"effectiveDefaultModel": currentDefaultModel(),
@@ -971,7 +973,11 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 	if changed {
 		setProxyConfig(cfg)
-		saveConfigToPool()
+		if err := saveConfigToPool(); err != nil {
+			setProxyConfig(old)
+			writeAPI(w, http.StatusInternalServerError, apiResponse{Error: "cannot save config: " + err.Error()})
+			return
+		}
 	}
 
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
@@ -1027,7 +1033,7 @@ func handleAdminStats(w http.ResponseWriter, r *http.Request) {
 			"cooldown": cooldown,
 			"expired":  expired,
 			"strategy": getProxyConfig().Strategy,
-			"version":  "go-1.1",
+			"version":  appVersion,
 		},
 	})
 }
