@@ -340,38 +340,52 @@ function toast(msg, t) {
 }
 
 // ========== 导航 ==========
+const pageNames = ['dashboard', 'accounts', 'import', 'settings'];
+const importMethods = ['oauth', 'token', 'batch'];
+let currentRoute = '';
+
 document.querySelectorAll('.nav-item[data-tab]').forEach(el => {
-  el.addEventListener('click', () => {
-    if (el.classList.contains('active')) return;
-    document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
-    el.classList.add('active');
-    document.querySelectorAll('.tab-panel').forEach(e => e.style.display = 'none');
-    _('tab-' + el.dataset.tab).style.display = 'block';
-    if (el.dataset.tab === 'dashboard') { loadStats(); loadAccounts(); }
-    if (el.dataset.tab === 'accounts') loadAccounts();
-    if (el.dataset.tab === 'settings') { loadKeys(); loadModels(); loadConfig(); loadVersions(); }
-  });
+  el.addEventListener('click', () => switchTab(el.dataset.tab));
 });
 
-function switchTab(name) {
-  document.querySelectorAll('.nav-item').forEach(e => {
+function switchTab(name, method) {
+  if (!pageNames.includes(name)) name = 'dashboard';
+  if (!importMethods.includes(method)) method = document.querySelector('#importTabs .tab.active').dataset.tab;
+  const hash = '#' + name + (name === 'import' ? '/' + method : '');
+  if (location.hash !== hash) history.pushState(null, '', hash);
+  restoreRoute();
+}
+
+function restoreRoute() {
+  const parts = location.hash.slice(1).split('/');
+  const name = pageNames.includes(parts[0]) ? parts[0] : 'dashboard';
+  const method = importMethods.includes(parts[1]) ? parts[1] : 'oauth';
+  const hash = '#' + name + (name === 'import' ? '/' + method : '');
+  if (location.hash !== hash) history.replaceState(null, '', hash);
+  if (currentRoute === hash) return;
+  currentRoute = hash;
+
+  document.querySelectorAll('.nav-item[data-tab]').forEach(e => {
     e.classList.toggle('active', e.dataset.tab === name);
   });
-  document.querySelectorAll('.tab-panel').forEach(e => e.style.display = 'none');
-  _('tab-' + name).style.display = 'block';
+  document.querySelectorAll('.tab-panel').forEach(e => {
+    e.style.display = e.id === 'tab-' + name ? 'block' : 'none';
+  });
+  if (name === 'import') {
+    document.querySelectorAll('#importTabs .tab').forEach(e => e.classList.toggle('active', e.dataset.tab === method));
+    document.querySelectorAll('#import-oauth,#import-token,#import-batch').forEach(e => e.classList.toggle('active', e.id === 'import-' + method));
+  }
   if (name === 'dashboard') { loadStats(); loadAccounts(); }
   if (name === 'accounts') loadAccounts();
   if (name === 'settings') { loadKeys(); loadModels(); loadConfig(); loadVersions(); }
 }
 
+window.addEventListener('popstate', restoreRoute);
+window.addEventListener('hashchange', restoreRoute);
+
 // 导入子标签
 document.querySelectorAll('#importTabs .tab').forEach(el => {
-  el.addEventListener('click', () => {
-    document.querySelectorAll('#importTabs .tab').forEach(e => e.classList.remove('active'));
-    el.classList.add('active');
-    document.querySelectorAll('#import-oauth,#import-token,#import-batch').forEach(e => e.classList.remove('active'));
-    _('import-' + el.dataset.tab).classList.add('active');
-  });
+  el.addEventListener('click', () => switchTab('import', el.dataset.tab));
 });
 
 // ========== API 请求 ==========
@@ -405,7 +419,7 @@ async function loadAccounts() {
     const list = d.data.accounts;
     const tbody = _('accountTableBody');
     if (!list || list.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无账号，前往 <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent);cursor:pointer">导入账号</a> 页添加</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无账号，前往 <a href="#import/oauth" style="color:var(--accent);cursor:pointer">导入账号</a> 页添加</td></tr>';
       return;
     }
     const sn = { active: '活跃', cooldown: '冷却', expired: '已过期' };
@@ -799,12 +813,7 @@ async function loadConfig() {
 }
 
 // ========== 初始化 ==========
-loadStats();
-loadAccounts();
-loadKeys();
-loadModels();
-loadConfig();
-loadVersions();
+restoreRoute();
 setInterval(() => { loadVersions(); }, 60000);
 setTimeout(loadVersions, 5000);
 setInterval(() => { loadStats(); }, 10000);
